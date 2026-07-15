@@ -1,6 +1,6 @@
 import os
-import subprocess
 import json
+import subprocess
 from datetime import datetime
 
 import stripe
@@ -10,13 +10,24 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+
 app = Flask(__name__)
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
-PRINTER_NAME = "Ricoh_MP4000"
-LOGO_PATH = "/var/www/fermiglow/assets/images/logo.png"
+PRINTER_NAME = os.environ.get("PRINTER_NAME", "Your_Printer_Name")
+LOGO_PATH = os.environ.get("LOGO_PATH", "/path/to/logo.png")
+PRINTED_DIR = os.environ.get("PRINTED_DIR", "./printed-orders")
+PORT = int(os.environ.get("PORT", "4242"))
+
+os.makedirs(PRINTED_DIR, exist_ok=True)
 
 
 def money(amount_cents, currency):
@@ -34,19 +45,36 @@ def safe(value):
 def make_packing_slip(session, line_items):
     order_id = session.get("id", "")
     customer = session.get("customer_details") or {}
+
     shipping = session.get("shipping_details") or {}
-    address = shipping.get("address") or customer.get("address") or {}
+    collected = session.get("collected_information") or {}
+    collected_shipping = collected.get("shipping_details") or {}
 
-    name = shipping.get("name") or customer.get("name") or ""
+    address = (
+        (shipping.get("address") if shipping else None)
+        or (collected_shipping.get("address") if collected_shipping else None)
+        or customer.get("address")
+        or {}
+    )
+
+    name = (
+        shipping.get("name")
+        or collected_shipping.get("name")
+        or customer.get("name")
+        or customer.get("individual_name")
+        or collected.get("individual_name")
+        or ""
+    )
+
     email = customer.get("email") or ""
-    phone = customer.get("phone") or ""
+    phone = customer.get("phone") or shipping.get("phone") or ""
 
-    output = f"/tmp/fermiglow-order-{order_id}.pdf"
+    output = f"/tmp/stripe-order-{order_id}.pdf"
 
     c = canvas.Canvas(output, pagesize=A4)
     width, height = A4
 
-    # Logo only, good for B&W printer
+    # Logo
     if os.path.exists(LOGO_PATH):
         c.drawImage(
             LOGO_PATH,
@@ -58,6 +86,7 @@ def make_packing_slip(session, line_items):
             mask="auto",
         )
 
+    # Header
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 20)
     c.drawRightString(width - 15 * mm, height - 18 * mm, "PACKING SLIP")
@@ -69,7 +98,7 @@ def make_packing_slip(session, line_items):
     y = height - 45 * mm
 
     c.setFont("Helvetica-Bold", 15)
-    c.drawString(15 * mm, y, "Your Business Order")
+    c.drawString(15 * mm, y, "Order")
 
     c.setFont("Helvetica", 10)
     c.drawRightString(
@@ -77,7 +106,6 @@ def make_packing_slip(session, line_items):
         y,
         datetime.now().strftime("%d/%m/%Y %I:%M %p"),
     )
-
 
     # Product table
     y -= 14 * mm
@@ -96,15 +124,15 @@ def make_packing_slip(session, line_items):
     if not line_items:
         line_items = [
             {
-                "description": "Your Business Order",
+                "description": "Order",
                 "quantity": 1,
                 "amount_total": session.get("amount_total", 0),
             }
         ]
 
     for item in line_items:
-        description = safe(item.get("description"))
-        quantity = safe(item.get("quantity"))
+        description = safe(item.get("description") or "Order")
+        quantity = safe(item.get("quantity") or 1)
         amount = money(item.get("amount_total"), session.get("currency", "aud"))
 
         c.drawString(15 * mm, y, description[:48])
@@ -169,8 +197,8 @@ def make_packing_slip(session, line_items):
     c.drawString(15 * mm, y, "Packing Checklist")
 
     check_items = [
-        "Correct heater model packed",
-        "Instruction manual included",
+        "Correct product packed",
+        "Instruction/manual included if required",
         "Box checked and sealed",
         "Shipping label attached",
         "Order marked as packed",
@@ -197,7 +225,7 @@ def make_packing_slip(session, line_items):
     c.drawCentredString(
         width / 2,
         14 * mm,
-        "Your Business  |  Your business details  |  Thank you for your order",
+        "Thank you for your order",
     )
 
     c.save()
@@ -218,6 +246,7 @@ def print_pdf(pdf_path):
         ],
         check=True,
     )
+
 
 @app.route("/stripe-webhook", methods=["POST"])
 def stripe_webhook():
@@ -243,8 +272,8 @@ def stripe_webhook():
         if event_type == "checkout.session.completed":
             session = event["data"]["object"]
 
-        # New Stripe Event Destination snapshot format
-        elif event.get("object", {}).get("object") == "checkout.session":
+        # New Stripe Event Destination / snapshot format
+        elif isinstance(event.get("object"), dict) and event["object"].get("object") == "checkout.session":
             session = event["object"]
             event_type = "checkout.session.completed"
 
@@ -256,9 +285,16 @@ def stripe_webhook():
             print("Checkout not paid yet, ignored:", session.get("id"), flush=True)
             return jsonify({"received": True, "not_paid": True}), 200
 
+        session_id = session.get("id", "")
+        printed_marker = os.path.join(PRINTED_DIR, session_id + ".printed")
+
+        if os.path.exists(printed_marker):
+            print("Already printed, skipping:", session_id, flush=True)
+            return jsonify({"received": True, "already_printed": True}), 200
+
         try:
             line_items_response = stripe.checkout.Session.list_line_items(
-                session["id"],
+                session_id,
                 limit=10,
             )
 
@@ -271,7 +307,7 @@ def stripe_webhook():
             print("Could not fetch line items, using fallback item:", str(e), flush=True)
             line_items = [
                 {
-                    "description": "Your Business Order",
+                    "description": "Order",
                     "quantity": 1,
                     "amount_total": session.get("amount_total", 0),
                 }
@@ -280,7 +316,7 @@ def stripe_webhook():
         if not line_items:
             line_items = [
                 {
-                    "description": "Your Business Order",
+                    "description": "Order",
                     "quantity": 1,
                     "amount_total": session.get("amount_total", 0),
                 }
@@ -289,17 +325,21 @@ def stripe_webhook():
         pdf_path = make_packing_slip(session, line_items)
         print_pdf(pdf_path)
 
-        print("Printed order:", session.get("id"), flush=True)
+        with open(printed_marker, "w") as f:
+            f.write(datetime.now().isoformat())
+
+        print("Printed order:", session_id, flush=True)
         return jsonify({"received": True, "printed": True}), 200
 
     except Exception as e:
         print("Print failed:", str(e), flush=True)
         return jsonify({"error": "print failed", "details": str(e)}), 500
 
+
 @app.route("/", methods=["GET"])
 def home():
-    return "Your Business Stripe printer is running."
+    return "Stripe packing slip printer is running."
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=4242)
+    app.run(host="127.0.0.1", port=PORT)
