@@ -28,3 +28,8 @@ Built for small businesses that want a low-cost way to print packing slips from 
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+## Donate
+
+If this project helped you, you can support it here:
+
+https://www.paypal.me/LGClub
